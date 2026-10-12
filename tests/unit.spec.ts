@@ -2,6 +2,7 @@ import { computeBackoff, resolveRetry } from '../lib/utils/backoff.util.js';
 import { toMs } from '../lib/utils/duration.util.js';
 import { OutboxError } from '../lib/errors/outbox.error.js';
 import { describeError } from '../lib/utils/describe-error.util.js';
+import { findUnstorableText } from '../lib/utils/storable-text.util.js';
 import { OutboxPublishTimeoutError } from '../lib/errors/outbox-publish-timeout.error.js';
 import { OutboxTransactionRequiredError } from '../lib/errors/outbox-transaction-required.error.js';
 import { OutboxNoHandlerError } from '../lib/errors/outbox-no-handler.error.js';
@@ -109,6 +110,17 @@ describe('helpers', () => {
     );
     expect(describeError({ code: 42 })).toBe('{"code":42}');
     expect(describeError(new Error('x'.repeat(5_000))).length).toBeLessThanOrEqual(2_001);
+  });
+
+  it('finds text a database refuses at any depth, deeper than a recursive walk or JSON.parse() could go', () => {
+    let deep: unknown = 'leaf\u0000';
+    for (let i = 0; i < 100_000; i++) {
+      deep = [deep];
+    }
+    const found = findUnstorableText(deep);
+    expect(found?.problem).toBe('U+0000');
+    expect(found?.path).toBe(`$${'[0]'.repeat(100_000)}`);
+    expect(findUnstorableText([[{ a: ['ok', { b: '😀' }] }]])).toBeUndefined();
   });
 
   describe('describeError on text a database refuses', () => {
