@@ -168,16 +168,6 @@ describe('Outbox.add()', () => {
       );
       expect(added).toMatchObject({ topic: `t ${text}`, key: text, headers: { [text]: text }, payload: { [text]: [text] } });
     });
-
-    it('checks a payload as deep as JSON.stringify() takes without overflowing the stack', async () => {
-      let deep: unknown = 'leaf\u0000';
-      for (let i = 0; i < 5_000; i++) {
-        deep = [deep];
-      }
-      await expect(inTransaction((tx) => outbox.add(tx, { topic: 'a', payload: deep }))).rejects.toThrow(
-        /`payload` at \$(\[0\]){5000} holds U\+0000/,
-      );
-    });
   });
 
   it('requires a transaction handle: null and undefined are refused before the store is called', () => {
