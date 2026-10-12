@@ -3,9 +3,9 @@
  * through every client, at REPEATABLE READ and READ COMMITTED, published in the order they commit; concurrent claims
  * through every client taking every claimable message between them, a key's run with one owner; a producer's
  * rollback, which burns an AUTO_INCREMENT value the relay never waits for; a claim that meets a key whose head another
- * connection is writing; keys that share a lock bucket (their producers take turns: the false contention, measured),
- * ordered all the same; the lock table's rows, one per bucket, created at startup, however many keys producers churn
- * through; and a producer's rollback while others wait for its bucket, which deadlocks them only when the bucket's row
+ * connection is writing, or rows in the middle of a key's run past the first statement of gap reads; keys that share a
+ * lock bucket (their producers take turns: the false contention, measured), ordered all the same; the lock table's
+ * rows, one per bucket, created at startup, however many keys producers churn through; and a producer's rollback while others wait for its bucket, which deadlocks them only when the bucket's row
  * is missing (MySQL's error 1213 in the application's transaction, which runs it again).
  */
 import { randomUUID } from 'node:crypto';
@@ -202,6 +202,34 @@ describe(`${mysql2Client.name}: a claim and a write in flight`, () => {
     }
 
     expect((await store.claim({ owner: 'r3', now: 1_000, leaseMs: 1_000, limit: 10 })).map((m) => m.topic)).toEqual(['head', 'tail']);
+  });
+
+  it('cuts a key at its first row passed over in the middle of its run, past the first statement of gap reads', async () => {
+    const { client, store } = opened;
+    // More keyed rows than one statement of gap reads holds (250), before the keys with gaps.
+    const filler = Array.from({ length: 300 }, (_, i) => message(`filler-${i}`, `F${i}`));
+    const k = Array.from({ length: 7 }, (_, i) => message(`k${i + 1}`, 'K'));
+    const l = Array.from({ length: 3 }, (_, i) => message(`l${i + 1}`, 'L'));
+    const free = message('free');
+    await client.transaction((tx) => store.add(tx, [...filler, ...k, ...l, free]));
+
+    const writer = await database!.admin.getConnection();
+    try {
+      await writer.beginTransaction();
+      // Two rows of K and one of L written elsewhere: K has two cuts (k4, k6), L one (l3).
+      await writer.query('SELECT 1 FROM race_claim_messages WHERE id IN (?) FOR UPDATE', [[k[2]!.id, k[4]!.id, l[1]!.id]]);
+      const batch = await store.claim({ owner: 'r1', now: 10, leaseMs: 1_000, limit: 1_000 });
+      expect(batch.map((m) => m.topic)).toEqual([...filler.map((m) => m.topic), 'k1', 'k2', 'l1', 'free']);
+      for (const m of [k[0]!, k[1]!, l[0]!]) {
+        expect(await store.markPublished(m.id, 'r1')).toBe(true);
+      }
+    } finally {
+      await writer.rollback();
+      writer.release();
+    }
+
+    const rest = await store.claim({ owner: 'r2', now: 10, leaseMs: 1_000, limit: 1_000 });
+    expect(rest.map((m) => m.topic)).toEqual(['k3', 'k4', 'k5', 'k6', 'k7', 'l2', 'l3']);
   });
 });
 

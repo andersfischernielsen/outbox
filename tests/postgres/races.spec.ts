@@ -1,8 +1,9 @@
 /**
  * PostgresOutboxStore's races on PostgreSQL, beyond the contract suites': many producers of one key whose transactions
  * overlap, through every client, published in the order they commit; a claim that meets a key whose head another
- * connection is writing, which leaves the rest of the key behind it; and producers whose keys share a lock number,
- * forced into the turns that deadlock when locks are taken in the keys' order.
+ * connection is writing, which leaves the rest of the key behind it, or rows in the middle of a key's run, which cut the
+ * key at the first; and producers whose keys share a lock number, forced into the turns that deadlock when locks are
+ * taken in the keys' order.
  */
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
@@ -116,6 +117,33 @@ describe(`${pgClient.name}: a claim and a write in flight`, () => {
     }
 
     expect((await store.claim({ owner: 'r3', now: 1_000, leaseMs: 1_000, limit: 10 })).map((m) => m.topic)).toEqual(['head', 'tail']);
+  });
+
+  it('cuts a key at its first row passed over in the middle of its run: the rows before it are leased, the rest waits', async () => {
+    const { client, store } = opened;
+    const filler = Array.from({ length: 300 }, (_, i) => message(`filler-${i}`, `F${i}`));
+    const k = Array.from({ length: 7 }, (_, i) => message(`k${i + 1}`, 'K'));
+    const l = Array.from({ length: 3 }, (_, i) => message(`l${i + 1}`, 'L'));
+    const free = message('free');
+    await client.transaction((tx) => store.add(tx, [...filler, ...k, ...l, free]));
+
+    const writer = await database!.admin.connect();
+    try {
+      await writer.query('BEGIN');
+      // Two rows of K and one of L written elsewhere: K has two cuts (k4, k6), L one (l3).
+      await writer.query('SELECT 1 FROM race_claim.messages WHERE id = ANY($1) FOR UPDATE', [[k[2]!.id, k[4]!.id, l[1]!.id]]);
+      const batch = await store.claim({ owner: 'r1', now: 10, leaseMs: 1_000, limit: 1_000 });
+      expect(batch.map((m) => m.topic)).toEqual([...filler.map((m) => m.topic), 'k1', 'k2', 'l1', 'free']);
+      for (const m of [k[0]!, k[1]!, l[0]!]) {
+        expect(await store.markPublished(m.id, 'r1')).toBe(true);
+      }
+    } finally {
+      await writer.query('ROLLBACK');
+      writer.release();
+    }
+
+    const rest = await store.claim({ owner: 'r2', now: 10, leaseMs: 1_000, limit: 1_000 });
+    expect(rest.map((m) => m.topic)).toEqual(['k3', 'k4', 'k5', 'k6', 'k7', 'l2', 'l3']);
   });
 });
 

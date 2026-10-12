@@ -29,7 +29,11 @@ export interface OutboxRelayOptions {
   enabled?: boolean;
   /** Wait between polls when idle. Default 1s. */
   pollInterval?: Duration;
-  /** Messages claimed per poll. Default 100. */
+  /**
+   * Messages claimed per poll. Default 100. Claims take turns, and a claim's time counts against its lease: on the
+   * PostgreSQL and MySQL stores, a claim of n messages of one key reads about n²/2 index entries (each one's older
+   * messages), so a batch of thousands from one key's backlog takes seconds.
+   */
   batchSize?: number;
   /** How long a claim is exclusive. Default 30s. */
   lease?: Duration;

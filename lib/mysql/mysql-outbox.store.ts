@@ -48,6 +48,14 @@ const IDS_PER_STATEMENT = 1_000;
 const BATCH_JSON_LENGTH = 1 << 20;
 
 /**
+ * The gap reads one statement of `claim()` carries at most. MySQL's time and memory for a `UNION ALL` grow faster than
+ * its branches: one of 10,000 took seconds, and a server with a few GB of memory was killed for it. Statements of 250
+ * keep a claim's cost linear in its size. One `JSON_TABLE()` statement of every row would be faster on short keys, but
+ * MySQL can't bound its reads by each row's `seq`, so it read the whole of a key for each of the key's rows.
+ */
+const GAP_READS_PER_STATEMENT = 250;
+
+/**
  * The first-party `OutboxStore` and `OutboxInboxStore` on MySQL (8.4 LTS and 9.x), through the client the application
  * already has (`fromMysql2()`, `fromDrizzle()`, `fromTypeOrm()`, `fromPrisma()`, `fromKysely()`). It keeps the
  * messages, the dead letters and the consumers' inbox in tables of its own in the connection's database
@@ -640,31 +648,37 @@ FROM ${this.t.deadLetters} d WHERE ${i.in('d.id', chunk)} ORDER BY d.seq`,
   /**
    * The rows of `due` (in `seq` order) that a message of their key sits right before, other than the previous row of
    * the key in `due`: for the first of a key, any older message of the key; for the next, any between the two. One
-   * index range read per row, with constant bounds, in one statement.
+   * index range read per row, with constant bounds, `GAP_READS_PER_STATEMENT` to a statement.
    */
   private async gaps(tx: SqlTransaction, due: readonly Row[]): Promise<Set<string>> {
-    const p = new SqlParams();
-    const reads: string[] = [];
+    const reads: { seq: string; key: string; after: string | undefined }[] = [];
     const previous = new Map<string, string>();
     for (const row of due) {
       if (row.key === null) {
         continue;
       }
 
-      const after = previous.get(row.key);
-      reads.push(
-        `(SELECT CAST(${p.text(row.seq)} AS CHAR) AS seq FROM ${this.t.messages} o FORCE INDEX (messages_key_seq)
-WHERE o.\`key\` = ${p.text(row.key)} AND o.seq < CAST(${p.text(row.seq)} AS SIGNED)${after === undefined ? '' : ` AND o.seq > CAST(${p.text(after)} AS SIGNED)`}
-LIMIT 1)`,
-      );
+      reads.push({ seq: row.seq!, key: row.key, after: previous.get(row.key) });
       previous.set(row.key, row.seq!);
     }
-    if (reads.length === 0) {
-      return new Set();
-    }
 
-    const rows = await tx.query<Row>(reads.join('\nUNION ALL\n'), p.values);
-    return new Set(rows.map((row) => row.seq!));
+    const gaps = new Set<string>();
+    for (let start = 0; start < reads.length; start += GAP_READS_PER_STATEMENT) {
+      const p = new SqlParams();
+      const statement = reads
+        .slice(start, start + GAP_READS_PER_STATEMENT)
+        .map(
+          ({ seq, key, after }) =>
+            `(SELECT CAST(${p.text(seq)} AS CHAR) AS seq FROM ${this.t.messages} o FORCE INDEX (messages_key_seq)
+WHERE o.\`key\` = ${p.text(key)} AND o.seq < CAST(${p.text(seq)} AS SIGNED)${after === undefined ? '' : ` AND o.seq > CAST(${p.text(after)} AS SIGNED)`}
+LIMIT 1)`,
+        )
+        .join('\nUNION ALL\n');
+      for (const row of await tx.query<Row>(statement, p.values)) {
+        gaps.add(row.seq!);
+      }
+    }
+    return gaps;
   }
 
   /** Throws the requeue clash's error when a pending message has one of `ids`. */
