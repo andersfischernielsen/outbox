@@ -165,9 +165,10 @@ ORDER BY m.n`,
    * order, up to `limit`, each checked against its key's older messages; `SKIP LOCKED` passes over a row another
    * connection is writing at that moment (a relay's fenced write, a release). A message whose predecessor in its key
    * isn't one of the rows the statement locked (passed over, or changed since the statement started) stays unleased,
-   * and the rest of its key with it, so no key's run is split or reordered. Claims take turns under the claim lock, so
-   * each one's statement starts after the one before it committed and sees its leases, instead of passing over its
-   * rows (and the keys behind them) and returning a thinner batch.
+   * and the rest of its key with it, so no key's run is split or reordered: each key's first such row is its cut, joined
+   * back by key (a search of the cuts for each row scanned them all, and the time grew with the square of `limit`).
+   * Claims take turns under the claim lock, so each one's statement starts after the one before it committed and sees
+   * its leases, instead of passing over its rows (and the keys behind them) and returning a thinner batch.
    */
   async claim({ owner, now, leaseMs, limit }: OutboxClaimRequest): Promise<OutboxMessage[]> {
     await this.readiness.ready();
@@ -189,10 +190,10 @@ ORDER BY m.n`,
   ) AS previous
   FROM due d
 ), cut AS (
-  SELECT c.key, c.seq FROM checked c WHERE c.previous NOT IN (SELECT due.seq FROM due)
+  SELECT c.key, min(c.seq) AS seq FROM checked c WHERE c.previous NOT IN (SELECT due.seq FROM due) GROUP BY c.key
 ), taken AS (
-  SELECT c.seq FROM checked c
-  WHERE c.key IS NULL OR NOT EXISTS (SELECT 1 FROM cut WHERE cut.key = c.key AND cut.seq <= c.seq)
+  SELECT c.seq FROM checked c LEFT JOIN cut ON cut.key = c.key
+  WHERE c.key IS NULL OR cut.seq IS NULL OR c.seq < cut.seq
 ), leased AS (
   UPDATE ${this.t.messages} m SET lease_owner = ${p.text(owner)}, lease_until = ${p.bigint(epochMs(now + leaseMs))}
   FROM taken WHERE m.seq = taken.seq
