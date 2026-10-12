@@ -7,6 +7,7 @@ import { OutboxRelay } from './services/outbox-relay.service.js';
 import type { OutboxStore } from './interfaces/outbox-store.interface.js';
 import { OutboxStorage } from './storage/outbox.storage.js';
 import { isName } from './utils/name.util.js';
+import { findUnstorableText, unstorableText } from './utils/storable-text.util.js';
 import { uuidv7 } from './utils/uuid.util.js';
 
 /**
@@ -24,6 +25,9 @@ export class Outbox<Tx = unknown> {
   /**
    * Writes the message(s) through `tx`, your open transaction. Nothing is published
    * until the transaction commits and the relay picks the rows up.
+   *
+   * A message whose topic, key, id, headers or payload holds U+0000 or a lone UTF-16 surrogate is refused with a
+   * `TypeError`, on every store: PostgreSQL can't store either, and MySQL can't store a lone surrogate.
    *
    * The store call happens before `add()` returns, so with a synchronous store (the
    * in-memory one, or yours on a synchronous driver) the result is not a promise. With an
@@ -70,6 +74,9 @@ function build<P>(input: NewOutboxMessage<P>, now: number): OutboxMessage<P> {
   if (json === undefined) {
     throw new TypeError('Outbox payload must be JSON-serializable');
   }
+  const payload: P = JSON.parse(json);
+  const headers = { ...input.headers };
+  refuseUnstorableText(input, headers, payload);
 
   const availableAt =
     input.availableAt !== undefined ? +input.availableAt : now + toMs(input.delay ?? 0);
@@ -82,14 +89,37 @@ function build<P>(input: NewOutboxMessage<P>, now: number): OutboxMessage<P> {
   return {
     id: input.id ?? uuidv7(),
     topic: input.topic,
-    payload: JSON.parse(json),
-    headers: { ...input.headers },
+    payload,
+    headers,
     key: input.key ?? null,
     createdAt: now,
     availableAt,
     attempts: 0,
     lastError: null,
   };
+}
+
+/** Text the SQL stores can't keep fails here, inside the caller's transaction, rather than as a driver error. */
+function refuseUnstorableText(input: NewOutboxMessage<unknown>, headers: object, payload: unknown): void {
+  for (const field of ['topic', 'key', 'id'] as const) {
+    const value = input[field];
+    const problem = typeof value === 'string' ? unstorableText(value) : undefined;
+    if (problem) {
+      throw unstorable(`\`${field}\``, problem);
+    }
+  }
+  for (const [field, value] of Object.entries({ headers, payload })) {
+    const found = findUnstorableText(value);
+    if (found) {
+      throw unstorable(`\`${field}\` at ${found.path}`, found.problem);
+    }
+  }
+}
+
+function unstorable(where: string, problem: string): TypeError {
+  return new TypeError(
+    `Outbox message: ${where} holds ${problem}, which a database can't store (U+0000 and lone UTF-16 surrogates are refused)`,
+  );
 }
 
 function isBatch<P>(

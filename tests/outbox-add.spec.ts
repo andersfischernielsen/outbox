@@ -127,6 +127,59 @@ describe('Outbox.add()', () => {
     expect(pending()).toEqual([]);
   });
 
+  describe('text a database refuses: U+0000 and lone UTF-16 surrogates', () => {
+    const loneSurrogate = (() => {
+      try {
+        JSON.parse('😀 not json');
+      } catch (error) {
+        return (error as SyntaxError).message; // V8 names the token: the first half of the emoji
+      }
+      throw new Error('JSON.parse accepted the text');
+    })();
+
+    it('refuses it in every field, naming the field and the path, before writing any of the batch', async () => {
+      expect(loneSurrogate.isWellFormed()).toBe(false);
+      const cases: [unknown, string][] = [
+        [{ topic: 'a\u0000b', payload: {} }, '`topic` holds U+0000'],
+        [{ topic: 'a', key: 'k\u0000', payload: {} }, '`key` holds U+0000'],
+        [{ topic: 'a', key: '\ud83d', payload: {} }, '`key` holds a lone UTF-16 surrogate'],
+        [{ topic: 'a', id: 'id\u0000', payload: {} }, '`id` holds U+0000'],
+        [{ topic: 'a', headers: { 'x-trace': 'a\u0000' }, payload: {} }, '`headers` at $["x-trace"] holds U+0000'],
+        [{ topic: 'a', headers: { 'x\udc00': 'a' }, payload: {} }, '`headers` at $["x\\udc00"] (its key) holds a lone'],
+        [{ topic: 'a', payload: 'a\u0000' }, '`payload` at $ holds U+0000'],
+        [{ topic: 'a', payload: { lines: [{ note: 'ok' }, { note: loneSurrogate }] } }, '`payload` at $.lines[1].note holds a lone'],
+        [{ topic: 'a', payload: { 'a\u0000': 1 } }, '`payload` at $["a\\u0000"] (its key) holds U+0000'],
+        // What the store keeps: the JSON of the payload, so a toJSON() result counts.
+        [{ topic: 'a', payload: { at: { toJSON: () => '\u0000' } } }, '`payload` at $.at holds U+0000'],
+      ];
+
+      for (const [invalid, error] of cases) {
+        const added = inTransaction((tx) => outbox.add(tx, [{ topic: 'valid', payload: {} }, invalid as OutboxMessage]));
+        await expect(added).rejects.toThrow(TypeError);
+        await expect(added).rejects.toThrow(error);
+      }
+      expect(pending()).toEqual([]);
+    });
+
+    it('keeps text with surrogate pairs and other control characters as it was', async () => {
+      const text = '😀 \u0001\t\n� \\u0000 \\ud83d';
+      const added = await inTransaction((tx) =>
+        outbox.add(tx, { topic: `t ${text}`, key: text, headers: { [text]: text }, payload: { [text]: [text] } }),
+      );
+      expect(added).toMatchObject({ topic: `t ${text}`, key: text, headers: { [text]: text }, payload: { [text]: [text] } });
+    });
+
+    it('checks a payload as deep as JSON.stringify() takes without overflowing the stack', async () => {
+      let deep: unknown = 'leaf\u0000';
+      for (let i = 0; i < 5_000; i++) {
+        deep = [deep];
+      }
+      await expect(inTransaction((tx) => outbox.add(tx, { topic: 'a', payload: deep }))).rejects.toThrow(
+        /`payload` at \$(\[0\]){5000} holds U\+0000/,
+      );
+    });
+  });
+
   it('requires a transaction handle: null and undefined are refused before the store is called', () => {
     const add = vi.spyOn(store, 'add');
     for (const tx of [null, undefined]) {

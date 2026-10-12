@@ -24,7 +24,7 @@ export interface OutboxMessage<P = unknown> {
   readonly lastError: string | null;
 }
 
-/** Input to `Outbox.add()`. */
+/** Input to `Outbox.add()`. No string in it may hold U+0000 or a lone UTF-16 surrogate: `add()` throws a `TypeError`. */
 export interface NewOutboxMessage<P = unknown> {
   topic: string;
   payload: P;
