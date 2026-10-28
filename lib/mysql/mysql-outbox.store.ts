@@ -181,9 +181,11 @@ export class MySqlOutboxStore implements OutboxStore, OutboxInboxStore, OnModule
   /**
    * Inserts the messages through the application's transaction. First it locks, on that transaction, the lock row of
    * each key's bucket (`<schema>_locks`), so a key's messages are numbered in the order their transactions commit.
-   * Anything but a transaction object of the executor's client fails with `OutboxTransactionRequiredError`; an id,
-   * topic or key longer than 255 characters with a `RangeError`, before any statement. A deadlock in the application's
-   * transaction (MySQL's error 1213) rolled it back, so it rejects: the application runs its transaction again.
+   * A handle the executor can't join as a transaction, such as the database or pool itself, fails with
+   * `OutboxTransactionRequiredError`; an id, topic or key longer than 255 characters with a `RangeError`, before any
+   * statement. The transaction's database isn't checked: a transaction on another database writes the messages there,
+   * where this store's relays don't read them. A deadlock in the application's transaction (MySQL's error 1213) rolled
+   * it back, so it rejects: the application runs its transaction again.
    */
   async add(transaction: unknown, messages: readonly OutboxMessage[]): Promise<void> {
     const tx = this.inTransaction(transaction, 'add');
@@ -531,8 +533,9 @@ FROM ${this.t.deadLetters} d WHERE ${i.in('d.id', chunk)} ORDER BY d.seq`,
    * Insert-if-absent on the `(consumer, message_id)` key, in one statement: a plain `INSERT`, and MySQL's duplicate-key
    * error (1062) for a record that exists, which rolls back the statement, not the transaction (never `INSERT IGNORE`,
    * which turns other errors into warnings). A concurrent delivery of the message waits for this transaction, then finds
-   * the record. Through the application's transaction when given one (anything but a transaction object of the
-   * executor's client fails with `OutboxTransactionRequiredError`), else at once.
+   * the record. Through the application's transaction when given one (a handle the executor can't join as a
+   * transaction fails with `OutboxTransactionRequiredError`; one on another database records the message there), else
+   * at once.
    */
   async recordInbox(transaction: unknown, consumer: string, messageId: string, now: number): Promise<boolean> {
     let db: SqlTransaction = this.executor;

@@ -125,8 +125,10 @@ export class PostgresOutboxStore implements OutboxStore, OutboxInboxStore, OnMod
 
   /**
    * Inserts the messages through the application's transaction. First it takes a transaction-scoped lock per key on
-   * that transaction, so a key's messages are numbered in the order their transactions commit. Anything but a
-   * transaction object of the executor's client fails with `OutboxTransactionRequiredError`.
+   * that transaction, so a key's messages are numbered in the order their transactions commit. A handle the executor
+   * can't join as a transaction, such as the database or pool itself, fails with `OutboxTransactionRequiredError`. The
+   * transaction's database isn't checked: a transaction on another database writes the messages there, where this
+   * store's relays don't read them.
    */
   async add(transaction: unknown, messages: readonly OutboxMessage[]): Promise<void> {
     const tx = this.inTransaction(transaction, 'add');
@@ -394,8 +396,9 @@ SELECT count(*)::text AS n FROM purged`,
 
   /**
    * Insert-if-absent on the `(consumer, message_id)` key, in one statement: a concurrent delivery of the message waits
-   * for this transaction, then finds the record. Through the application's transaction when given one (anything but a
-   * transaction object of the executor's client fails with `OutboxTransactionRequiredError`), else at once.
+   * for this transaction, then finds the record. Through the application's transaction when given one (a handle the
+   * executor can't join as a transaction fails with `OutboxTransactionRequiredError`; one on another database records
+   * the message there), else at once.
    */
   async recordInbox(transaction: unknown, consumer: string, messageId: string, now: number): Promise<boolean> {
     let db: SqlTransaction = this.executor;
