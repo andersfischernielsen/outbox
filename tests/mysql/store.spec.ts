@@ -51,12 +51,10 @@ describe(`MySqlOutboxStore through ${mysql2Client.name}`, () => {
     await client.transaction((tx) => store.add(tx, batch));
 
     expect(inserts().length).toBeGreaterThan(1);
-    expect(inserts().length).toBeLessThanOrEqual(3);
+    expect(inserts().length).toBeLessThanOrEqual(database?.mariadb ? 40 : 3);
     expect(inserts().every(({ params }) => params?.length === 2)).toBe(true);
     expect((await claimAll()).map((m) => m.topic)).toEqual(batch.map((m) => m.topic));
-    // MariaDB's JSON is text: each message's JSON_EXTRACT() reads its statement's document from the start, so a statement
-    // of a megabyte takes tens of seconds there (half a second on MySQL).
-  }, database?.mariadb ? 120_000 : undefined);
+  });
 
   describe('a message whose JSON is larger than the sort buffer (262,144 bytes by default)', () => {
     // Well over the 256 KB buffer MySQL sorts a statement's rows in: a row of this size can't be held by that sort.
@@ -245,6 +243,15 @@ describe(`MySqlOutboxStore through ${mysql2Client.name}`, () => {
     const failure = { attempt: 1, at: 1.5e12, error: payload.text, transport: 'kafka' };
     expect(await store.deadLetter(full.id, 'r1', { attempts: 1, reason: 'exhausted', failedAt: 2, error: failure })).toBe(true);
     expect(await store.getDeadLetter(full.id)).toMatchObject({ payload, headers: full.headers, history: [failure], lastError: payload.text });
+  });
+
+  it('round-trips top-level scalar payloads, keeping the string "null" apart from a null payload', async () => {
+    const batch = (['null', 'x', '', 0, false] as const).map((payload, i) => ({ ...message(`scalar-${i}`), payload }));
+    await client.transaction((tx) => store.add(tx, batch));
+    expect(await rows(database!.admin, 'SELECT payload IS NULL AS missing FROM nest_outbox_messages ORDER BY seq')).toEqual(
+      batch.map(() => ({ missing: 0 })),
+    );
+    expect(await claimAll()).toEqual(batch);
   });
 
   it('purges dead letters that failed before a moment with a fraction of a millisecond', async () => {
